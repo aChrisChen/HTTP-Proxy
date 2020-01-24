@@ -1,0 +1,234 @@
+#!/usr/bin/env python
+
+import re
+import select
+from socket import socket, AF_INET, SOCK_STREAM
+import sys
+import thread
+import time
+import xml.etree.ElementTree as ET
+
+
+BUFFER_SIZE = 1048576
+
+bitrates = []
+
+
+def get_content_length(header):
+  content_length = 0
+  lines = header.split("\r\n")
+  for line in lines:
+    if line.startswith("Content-Length"):
+      content_length = int(line.split(" ")[1])
+  return content_length
+
+
+def recv_http_message(socket):
+  header = ""
+  body = ""
+  not_found_header = True
+  content_length = -1
+  while True:
+    # print "now, content_length = " + str(content_length)
+    # print "body length = " + str(len(body))
+    cur = socket.recv(BUFFER_SIZE) 
+    # if len(cur) < 100:
+    #   print "** printing from the recv_http_message"
+    #   print str(repr(cur))
+    #   print "** stop printing from the recv_http_message"
+    if not_found_header:
+      header += cur
+    else:
+      body += cur
+
+    if len(cur) == 0:
+      return "", 0 # my last bug :)
+
+    if content_length != -1 and len(body) >= content_length:
+      break
+    
+    if "\r\n\r\n" in header:
+      splited = header.split("\r\n\r\n")
+      header = splited[0]
+      body = splited[1]
+      not_found_header = False
+      content_length = get_content_length(header)
+      if content_length == 0 or len(body) >= content_length:
+        break
+  http_message = header + "\r\n\r\n" + body
+  # print "in the end, length of http_message : " + str(len(http_message))
+  # print "in the end, length of head : " + str(len(header))
+  # print "in the end, length of body : " + str(len(body))
+  return http_message, content_length
+
+
+def get_http_path(http_message):
+  lines = http_message.split("\r\n")
+  first_line_list = lines[0].split(" ")
+  return first_line_list[1]
+
+
+def get_bitrates_from_f4m(http_message_f4m):
+  bitrates = []
+  body = http_message_f4m.split("\r\n\r\n")[1]
+  root = ET.fromstring(body)
+  for media in root.findall('{http://ns.adobe.com/f4m/1.0}media'):
+      bitrates.append(int(media.attrib["bitrate"]))
+  return sorted(bitrates)
+
+
+def get_floor_or_min(ls, x):
+    l = 0
+    r = len(ls) - 1
+    while l <= r:
+        mid = (l + r) // 2
+        if ls[mid] == x:
+            return mid
+        elif ls[mid] < x:
+            l = mid + 1
+        else:
+            r = mid - 1
+    # if no rate satisfies x, we will chose the smallest
+    if r == -1:
+        r = 0
+    return ls[r]
+
+
+def get_bitrate(http_message):
+  m = re.search(r"\d+", http_message)
+  return int(http_message[int(m.start()) : int(m.end())])
+
+
+def modify_req_bitrate(http_message, bitrate):
+  m = re.search(r"\d+", http_message)
+  new_http_message = http_message[:int(m.start())] + str(bitrate) + http_message[int(m.end()):]
+  return new_http_message
+
+
+def modify_file_name(http_message, old_file_name, new_file_name):
+  m = re.search(old_file_name, http_message)
+  new_http_message = http_message[:int(m.start())] + new_file_name + http_message[int(m.end()):]
+  return new_http_message
+
+
+def wait_for_read_or_write(socket, req_type):
+  while True:
+    rs, ws, errs = select.select([socket], [socket], [socket], 1)
+    if req_type == "read" and len(rs) > 0:
+      return 0
+    if req_type == "write" and len(ws) > 0:
+      return 0
+    if len(errs) > 0:
+      return -1
+
+
+def start_proxy(log, alpha, inSocket, proxy_ip, server_ip, server_port):
+  outSocket = socket(AF_INET, SOCK_STREAM)
+  outSocket.bind((proxy_ip, 0)) 
+  outSocket.connect((server_ip, server_port))
+  print ("====== proxy start current TCP ======")
+  # step2: listen to the client
+  avg_tput = -1 # Kbps
+  flag_f4m = False
+  global bitrates
+  suggested_bitrate = -1
+  while True:
+    # step2.1: gather the whole message and modify
+    if wait_for_read_or_write(inSocket, "read") == -1:
+      break #!!!!!!error happen
+    message, content_length = recv_http_message(inSocket)
+    if len(message) < 10:
+      print ("proxy send the response to client: repr==" + str(repr(message)))
+    else:
+      print ("proxy receive the message from client: " + message.split("\r\n\r\n")[0])
+    print("\n++++++++++++\n")
+    # print get_http_path(message)
+    if len(message) == 0:
+      break
+
+    if get_http_path(message).endswith("f4m"):
+      flag_f4m = True
+    elif suggested_bitrate != -1 and get_http_path(message).startswith("/vod"):
+      print ("===== before modifying, the bitrate is " + str(get_http_path(message)))
+      message = modify_req_bitrate(message, suggested_bitrate)
+      print ("===== after modifying, the bitrate is " + str(get_http_path(message)))
+
+    # step2.2:
+    # step2.2.1: send the message to server and get response
+    t_s = time.time()
+    if wait_for_read_or_write(outSocket, "write") == -1:
+      break #!!!!!!error happen
+    outSocket.send(message)
+    if wait_for_read_or_write(outSocket, "read") == -1:
+      break #!!!!!!error happen
+    response, content_length = recv_http_message(outSocket)
+    t_f = time.time()
+    if len(response) == 0:
+      break
+
+    # step2.2.2: cal Throughput
+    duration = (t_f - t_s)
+    tput = len(response) * 8 / duration / 1e3
+    if avg_tput == -1:
+      avg_tput = tput
+    else:
+      avg_tput = alpha * tput + (1 - alpha) * avg_tput
+    if len(bitrates) > 0:
+      suggested_bitrate = get_floor_or_min(bitrates, avg_tput * 2 / 3)
+
+    # step2.3.3: write log
+    chunk_name = get_http_path(message)
+    bitrate = get_bitrate(message)
+    info = [time.time(), duration, tput, avg_tput, bitrate, server_ip, chunk_name]
+    log.write(" ".join([str(ind) for ind in info]) + "\n")
+    
+    # step2.2.4: get_bitrates_from_f4m
+    if flag_f4m:
+      flag_f4m = False
+      bitrates = get_bitrates_from_f4m(response)
+      # request for big_buck_bunny_nolist.f4m as requested
+      message = modify_file_name(message, "big_buck_bunny.f4m", "big_buck_bunny_nolist.f4m")
+      outSocket.send(message)
+      response, content_length = recv_http_message(outSocket)
+
+    # step2.3: send the reponse to client
+    if wait_for_read_or_write(inSocket, "write") == -1:
+      break #!!!!!!error happen
+    inSocket.send(response)
+    if len(response) < 10:
+      print ("proxy send the response to client: repr==" + str(repr(response)))
+    else:
+      print ("proxy send the response to client: " + response.split("\r\n\r\n")[0])
+    print("\n++++++++++++\n")
+  inSocket.close()
+  outSocket.close()
+  print ("====== proxy close current TCP ======")
+
+
+def main():
+  log = sys.argv[1]
+  alpha = float(sys.argv[2])
+  proxy_listen_port = int(sys.argv[3])
+  proxy_ip = sys.argv[4] # fake ip 
+  server_ip = sys.argv[5] 
+  server_port = 8080
+
+  welcomeSocket = socket(AF_INET, SOCK_STREAM)  # the welcome socket
+  welcomeSocket.bind(('', proxy_listen_port))
+  welcomeSocket.listen(10)
+  log = open(log, "w")
+  print 'The proxy welcome socket is ready to receive'
+
+  while True:
+    # step1: construct TCP connection with client and server
+    inSocket, addr = welcomeSocket.accept()
+    thread.start_new_thread(start_proxy, (log, alpha, inSocket, proxy_ip, server_ip, server_port))
+
+
+if __name__ == '__main__':
+  main()
+
+
+
+
+
